@@ -1,0 +1,61 @@
+// 本地日志分析实验。所有阶段都是模拟，不连接 GitLab 或 Kubernetes。
+pipeline {
+    agent none
+
+    options {
+        timeout(time: 2, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        choice(
+            name: 'FAIL_STAGE',
+            choices: ['Checkout', 'Build', 'Deploy', 'None'],
+            description: '选择在哪个阶段模拟失败；None 用作成功对照'
+        )
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo '[DEMO] 开始模拟代码拉取'
+                script {
+                    if (params.FAIL_STAGE == 'Checkout') {
+                        error('[DEMO][CHECKOUT_CONFIG_MISSING] 未配置 GitLab 仓库地址和凭据，停止代码拉取')
+                    }
+                }
+                echo '[DEMO] 模拟代码拉取完成'
+            }
+        }
+
+        stage('Build') {
+            steps {
+                echo '[DEMO] 开始模拟构建'
+                script {
+                    if (params.FAIL_STAGE == 'Build') {
+                        error('[DEMO][BUILD_TEST_FAILED] 模拟测试失败：expected=200, actual=500')
+                    }
+                }
+                echo '[DEMO] 模拟构建完成'
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                echo '[DEMO] 开始模拟部署'
+                script {
+                    if (params.FAIL_STAGE == 'Deploy') {
+                        error('[DEMO][DEPLOY_CONFIG_MISSING] 未配置目标 Kubernetes 集群和访问凭据，停止部署')
+                    }
+                }
+                echo '[DEMO] 模拟部署完成'
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "[DEMO] 本次构建结果：${currentBuild.currentResult}"
+        }
+    }
+}

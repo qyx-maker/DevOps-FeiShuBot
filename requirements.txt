@@ -1,0 +1,8 @@
+# HolmesGPT 0.40 supports Intel macOS with the universal2 cryptography wheel.
+holmesgpt==0.40.0
+cryptography==48.0.1
+lark-oapi
+openai
+pydantic
+python-dotenv
+requests

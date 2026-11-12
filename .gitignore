@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+.venv/
+feishu_knowledge.sqlite3*
+.DS_Store
+.vscode/
+.report-build/
+outputs/
+gitlab脚本/

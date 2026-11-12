@@ -1,0 +1,18 @@
+[Unit]
+Description=Jenkins Controller
+After=network.target
+RequiresMountsFor=/app
+
+[Service]
+Type=simple
+# 沿用现有进程身份。启用前需确认 Java、WAR 及其路径的写权限。
+User=root
+WorkingDirectory=/app
+Environment="HOME=/root"
+Environment="JENKINS_HOME=/app/data/jenkins/"
+ExecStart=/app/java/bin/java -Xms2G -Xmx2G -jar /app/jenkins.war --httpPort=18081
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
