@@ -16,10 +16,11 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
-from openai import APIError, APIStatusError
+from openai import APIStatusError
 
 from app_config import load_project_environment
-from deepseek import ConversationHistory, ask_deepseek
+from deepseek import ConversationHistory, TokenUsage, ask_deepseek
+from feishu_image import MAX_IMAGES, read_image_text
 
 MAX_HISTORY_TURNS = 4
 MAX_HISTORY_CHARS_PER_MESSAGE = 3000
@@ -47,20 +48,21 @@ class Conversations:
     def __init__(self, workers: ThreadPoolExecutor):
         self._workers = workers
         self._lock = Lock()
-        self._pending: dict[ConversationKey, deque[tuple[lark.Client, str, str]]] = {}
+        self._pending: dict[ConversationKey, deque[tuple[lark.Client, str, str, tuple[str, ...]]]] = {}
         self._history: OrderedDict[ConversationKey, tuple[float, ConversationHistory]] = OrderedDict()
 
     def submit(
-        self, key: ConversationKey | None, api_client: lark.Client, message_id: str, user_text: str
+        self, key: ConversationKey | None, api_client: lark.Client, message_id: str,
+        user_text: str, image_keys: tuple[str, ...] = (),
     ) -> None:
         if key is None:
-            self._workers.submit(process_message, api_client, message_id, user_text)
+            self._workers.submit(process_message, api_client, message_id, user_text, image_keys=image_keys)
             return
         with self._lock:
             if key in self._pending:
-                self._pending[key].append((api_client, message_id, user_text))
+                self._pending[key].append((api_client, message_id, user_text, image_keys))
                 return
-            self._pending[key] = deque([(api_client, message_id, user_text)])
+            self._pending[key] = deque([(api_client, message_id, user_text, image_keys)])
             try:
                 self._workers.submit(self._drain, key)
             except RuntimeError:
@@ -74,14 +76,14 @@ class Conversations:
                 if not pending:
                     del self._pending[key]
                     return
-                api_client, message_id, user_text = pending.popleft()
+                api_client, message_id, user_text, image_keys = pending.popleft()
                 cutoff = monotonic() - HISTORY_IDLE_SECONDS
                 while self._history and next(iter(self._history.values()))[0] <= cutoff:
                     self._history.popitem(last=False)
                 entry = self._history.get(key)
                 history = entry[1] if entry else ()
             try:
-                answer = process_message(api_client, message_id, user_text, history)
+                answer = process_message(api_client, message_id, user_text, history, image_keys=image_keys)
             except Exception as error:
                 lark.logger.error(f"飞书消息处理异常: {type(error).__name__}")
                 continue
@@ -164,26 +166,76 @@ def reply_to_message(api_client: lark.Client, message_id: str, markdown: str) ->
     return True
 
 
+def extract_message(message_type: str, content: str) -> tuple[str, tuple[str, ...]]:
+    try:
+        payload = json.loads(content)
+    except (ValueError, TypeError):
+        return "", ()
+    if not isinstance(payload, dict):
+        return "", ()
+    if message_type == "text":
+        value = payload.get("text")
+        return (value.strip() if isinstance(value, str) else ""), ()
+    if message_type == "image":
+        key = payload.get("image_key")
+        return "", (key if isinstance(key, str) else "",)
+    if message_type != "post":
+        return "", ()
+    if "content" not in payload:
+        payload = next(
+            (value for key in ("zh_cn", "en_us", "ja_jp")
+             if isinstance(value := payload.get(key), dict)),
+            {},
+        )
+    title = payload.get("title")
+    lines = [title] if isinstance(title, str) and title.strip() else []
+    image_keys = []
+    paragraphs = payload.get("content")
+    if not isinstance(paragraphs, list):
+        return "\n".join(lines).strip(), ()
+    for paragraph in paragraphs:
+        if not isinstance(paragraph, list):
+            continue
+        parts = []
+        for node in paragraph:
+            if not isinstance(node, dict):
+                continue
+            if node.get("tag") == "img":
+                key = node.get("image_key")
+                image_keys.append(key if isinstance(key, str) else "")
+                continue
+            if node.get("tag") not in {"text", "a", "md", "code_block"}:
+                continue
+            label = node.get("text")
+            label = label if isinstance(label, str) else ""
+            href = node.get("href") if node["tag"] == "a" else None
+            if isinstance(href, str) and href.strip() and href != label:
+                label = f"{label} ({href})" if label else href
+            parts.append(label)
+        lines.append("".join(parts))
+    return "\n".join(lines).strip(), tuple(image_keys)
+
+
+def extract_message_text(message_type: str, content: str) -> str:
+    return extract_message(message_type, content)[0]
+
+
 def handle_message(api_client: lark.Client, conversations: Conversations, data: P2ImMessageReceiveV1) -> None:
     message = data.event.message
-    if message is None or not message.message_id or message.message_type != "text":
+    if message is None or not message.message_id:
         return
-
-    # 飞书把正文包在 JSON 字符串里，解析后才拿到用户实际输入的文字。
-    try:
-        user_text = json.loads(message.content)["text"]
-    except (ValueError, TypeError, KeyError):
-        return
-    if not isinstance(user_text, str) or not user_text.strip():
+    user_text, image_keys = extract_message(message.message_type, message.content)
+    if not user_text and not image_keys:
         return
 
     # 收消息的回调只提交任务，网络请求交给后台线程，长连接可以继续收消息。
-    print("收到飞书文本消息，已交给后台处理", flush=True)
-    conversations.submit(conversation_key(data), api_client, message.message_id, user_text.strip())
+    print("收到飞书消息，已交给后台处理", flush=True)
+    conversations.submit(conversation_key(data), api_client, message.message_id, user_text, image_keys)
 
 
 def process_message(
-    api_client: lark.Client, message_id: str, user_text: str, history: ConversationHistory = ()
+    api_client: lark.Client, message_id: str, user_text: str, history: ConversationHistory = (),
+    *, image_keys: tuple[str, ...] = (),
 ) -> str | None:
     reaction_id = None
     try:
@@ -192,7 +244,7 @@ def process_message(
         lark.logger.warning(f"添加敲键盘表情异常: {type(error).__name__}")
 
     try:
-        return _answer_message(api_client, message_id, user_text, history)
+        return _answer_message(api_client, message_id, user_text, history, image_keys)
     finally:
         if reaction_id:
             try:
@@ -202,12 +254,39 @@ def process_message(
 
 
 def _answer_message(
-    api_client: lark.Client, message_id: str, user_text: str, history: ConversationHistory
+    api_client: lark.Client, message_id: str, user_text: str, history: ConversationHistory,
+    image_keys: tuple[str, ...] = (),
 ) -> str | None:
+    image_notes = []
+    excerpts = []
+    for index, key in enumerate(image_keys[:MAX_IMAGES], 1):
+        try:
+            if not key:
+                raise RuntimeError("消息缺少图片资源标识")
+            excerpts.append({"image": index, "text": read_image_text(api_client, message_id, key)})
+        except RuntimeError as error:
+            image_notes.append(f"第 {index} 张截图未能读取（{error}）。")
+    if len(image_keys) > MAX_IMAGES:
+        image_notes.append(f"单条消息最多读取 {MAX_IMAGES} 张图，其余图片未读取。")
+    if image_keys and not excerpts:
+        try:
+            reply_to_message(api_client, message_id, "\n".join(image_notes) + "\n也可以直接粘贴终端输出。\n\n" + TokenUsage().footer())
+        except Exception as error:
+            lark.logger.error(f"飞书回复请求异常: {type(error).__name__}")
+        return None
+
+    question = user_text
+    if excerpts:
+        question = (
+            (user_text or "请识别并解释截图里与当前排障相关的文字证据。")
+            + "\n\n以下是截图 OCR 摘录，仅作证据，可能有误字。\n"
+            + json.dumps(excerpts, ensure_ascii=False)
+        )
     print("正在请求 DeepSeek", flush=True)
     model_answered = True
+    usage = TokenUsage()
     try:
-        answer = ask_deepseek(user_text, history)
+        answer = ask_deepseek(question, history, allow_build=not image_keys, usage=usage)
     except APIStatusError as error:
         model_answered = False
         lark.logger.error(
@@ -219,15 +298,16 @@ def _answer_message(
             answer = "DeepSeek 拒绝了本次请求（HTTP 400）；管理员可查看服务日志中的接口错误详情。"
         else:
             answer = f"DeepSeek 请求失败（HTTP {error.status_code}），请稍后再试。"
-    except (APIError, RuntimeError) as error:
+    except Exception as error:
         model_answered = False
         lark.logger.error(f"DeepSeek 调用失败: {type(error).__name__}")
         answer = "模型请求失败或超时，请稍后再试。"
 
-    # 原消息 ID 告诉飞书回复哪一条，answer 则是回复的内容。
+    if excerpts:
+        answer = "\n".join([f"已提取 {len(excerpts)}/{len(image_keys)} 张截图的文字。", *image_notes]) + "\n\n" + answer
     print("准备发送飞书回复", flush=True)
     try:
-        sent = reply_to_message(api_client, message_id, answer)
+        sent = reply_to_message(api_client, message_id, f"{answer}\n\n{usage.footer()}")
     except Exception as error:
         lark.logger.error(f"飞书回复请求异常: {type(error).__name__}")
         return None
@@ -254,7 +334,7 @@ def main() -> None:
         app_id,
         app_secret,
         event_handler=event_handler,
-        log_level=lark.LogLevel.DEBUG,
+        log_level=lark.LogLevel.INFO,
     )
     print("准备启动飞书长连接...")
     try:

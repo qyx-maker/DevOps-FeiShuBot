@@ -8,10 +8,16 @@
 
 大肥鱼会把最近 4 轮成功回复的问答带给模型。私聊按会话记忆，群聊按群、发言人和话题隔离。同一会话按收到的顺序处理。记忆保存在进程内，闲置 30 分钟后不再使用，重启清空；不会补读飞书历史消息。
 
+闲聊和公开话题可直接回答。飞书回复底部显示当前消息对应的 DeepSeek 请求次数与输入、输出、合计 Token，按 API 返回的用量累加。未返回用量的请求会标明，统计行不进入会话记忆。
+
+处理终端或日志截图时，机器人使用飞书消息资源接口读取当前消息的图片，再用 macOS Vision 本地提取文字。单条最多识别 3 张，每张最多 8 MiB，需要 macOS 和 Xcode 命令行工具。模型接收 OCR 摘录，原图在本地处理。下载或识别失败时回复实际原因。
+
+图片下载若报 `99991672`，在飞书开放平台检查应用身份的「获取单聊、群组消息」权限（`im:message:readonly`），以接口实际返回的 scope 为准。确认权限随应用版本生效后重发截图。
+
 | 能力 | 当前行为 |
 | --- | --- |
 | Jenkins 构建 | 列出任务、查构建状态、读失败日志。明确要求触发时，按同一构建编号跟踪结果；失败时读取对应构建的日志 |
-| Kubernetes 诊断 | 通过本地 HolmesGPT SDK 分析测试环境中的资源状态、事件或日志；无需单独部署 Holmes API 服务 |
+| Kubernetes 诊断 | 支持未知目标时的节点、Pod 和告警事件概览，以及工作负载、Pod、路由、PVC、网络策略和单容器日志的定向查询 |
 | Prometheus 指标 | 模型按问题编写 PromQL，结合查询错误或空结果调整表达式；可与 Holmes 现场和 Jenkins 构建记录一起排查 |
 | 飞书知识检索 | 以飞书应用身份读取文件夹及子文件夹中的飞书 Docx，在 SQLite FTS5 中按正文片段检索。具体问题可命中同一篇文档的多段；全文总结按标题读取原文，长文可续页 |
 
@@ -32,6 +38,7 @@ test -f .env || cp .env.example .env
 | --- | --- |
 | `APP_ID`、`APP_SECRET` | 飞书自建应用凭据，用于机器人收发消息和读取知识库 |
 | `DEEPSEEK_API_KEY` | DeepSeek API Key；主对话和 Holmes 共用 |
+| `BRAVE_SEARCH_API_KEY` | 可选。公开网页搜索使用的 Brave Search API Key |
 | `JENKINS_USERNAME`、`JENKINS_API_TOKEN` | Jenkins 用户和 API Token；查询需要读取权限，触发测试任务还需要该任务的构建权限 |
 | `PROMETHEUS_URL`、`PROMETHEUS_ENVIRONMENT` | 可选；同一个测试环境的 Prometheus 地址和环境名。地址只填服务入口，不含 `/api/v1/query_range` |
 | `PROMETHEUS_BEARER_TOKEN` | 可选；服务入口需要 Bearer 认证时使用只读凭据 |
@@ -54,7 +61,7 @@ python feishu_python.py
 ## 验收示例
 
 1. **Jenkins：**在飞书发送「列出当前 Jenkins 任务」，再用实际任务名发送「查询 Jenkins 任务『任务名』最近一次构建状态」。需要验证失败链路时，可在本地 Jenkins 新建 Pipeline，使用 [Jenkinsfile.failure-demo](Jenkinsfile.failure-demo) 作为脚本，再明确要求机器人触发该测试任务。默认 `FAIL_STAGE=Checkout` 会模拟 Checkout 失败；检查回复里的构建编号和日志证据是否对应。参数化任务使用 Jenkins 的默认参数，缺少必填参数时需先补齐。
-2. **Holmes：**让机器人运行环境只持有测试集群的只读凭据，再发送「查看测试集群 `<命名空间>` 中的 Pod 状态」。核对实际传给 `ask_holmes` 的查询范围，并用同一命名空间的 `kubectl get pods` 结果核对回复。当前启用了 Holmes 的 `CORE` 和 `CLI` 工具，工具标签不能保证只读；用运行环境的凭据和权限约束访问范围。
+2. **本地集群诊断：**在 `.env` 设置 `HOLMES_KUBECONFIG`（独立的本地配置文件路径）和 `HOLMES_KUBE_CONTEXT`（准确的 context 名称）。重启后，先问已知命名空间里的服务状态，再发带链接的 TLS 故障追问。确认机器人沿用同一目标，并用 Ingress、Service 和 EndpointSlice 解释目前能定位到哪一步。Ingress 的 TLS 引用仅供核对配置，握手结果仍需从客户端取证。
 3. **飞书知识库：**在已授权的测试文件夹放一篇非敏感的飞书 Docx，执行 `python feishu_knowledge.py` 强制同步。确认输出的 `status` 为 `synced`、`documents_indexed` 大于 0。用文档后半段的关键词验证片段检索，再问「列出《文档标题》里的所有项目」，核对答复是否覆盖末尾条目并附原文链接。全文读取每页最多 18,000 字符，若有下一页会返回续读位置。常规查询会复用 15 分钟内的索引；修改文档后可强制同步。索引文件含文档正文，和 `.env` 一样只保留在本地。
 4. **联合排查：**配置一个只覆盖目标测试环境的 Prometheus，再用真实标签和任务名询问「联合排查测试环境 `<命名空间>` 的 `<服务>` 最近 30 分钟的 5xx 异常；Prometheus job 是 `<job>`，关联 Jenkins 任务是 `<任务全名>`」。对照 Prometheus 峰值时间、Holmes 检查目标和 Jenkins 构建编号。构建完成不能证明已部署；缺少某一路证据时，答复应标出缺口。
 
@@ -63,6 +70,8 @@ Prometheus 地址从机器人运行环境出发确认：已有 Grafana 时，可
 模型可以自行写 PromQL，Python 只向配置的地址调用 `query_range`：窗口 5–120 分钟、每 30 秒取点、每轮最多执行 4 次 Prometheus 查询，每次最多返回 8 条序列的摘要。PromQL 可能读取该账号可见的任意指标，测试环境应使用隔离的数据源和只读凭据。没有样本不自动按零处理。
 
 项目当前用于本地联调和测试环境验收，生产发布与自动回滚暂不在范围内。
+
+不清楚目标时可问「帮我扫一下本地集群，有异常就继续定位」。概览会优先返回有异常信号的资源，模型可据此再查明确的 Pod、工作负载或依赖。日志查询需要明确命名空间、Pod 和容器，每次最多返回最近 30 分钟的 40 行、8 KiB。诊断结果会发送给 DeepSeek，请使用不含敏感日志的本地测试集群。
 
 ## 代码入口
 

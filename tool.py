@@ -6,6 +6,7 @@ import holmes_ask
 import feishu_knowledge
 import jenkins_tools
 import prometheus_tools
+import public_search
 from app_config import load_project_environment
 from models import (
     GetBuildLogsArguments,
@@ -14,6 +15,7 @@ from models import (
     HolmesAskArguments,
     ListJenkinsJobsArguments,
     PrometheusMetricArguments,
+    PublicWebSearchArguments,
     QueryJenkinsBuildArguments,
     TriggerJenkinsArguments,
 )
@@ -21,6 +23,22 @@ from pydantic import ValidationError
 
 # 工具说明和执行方法在同一条注册记录里，避免只注册名字而没有真正调用。
 TOOL_REGISTRY = {
+    public_search.TOOL_NAME: {
+        "definition": {
+            "type": "function",
+            "function": {
+                "name": public_search.TOOL_NAME,
+                "description": (
+                    "联网搜索公开网页。用户明确要求联网、询问最新变化，或你无法确认公开话题时使用。"
+                    "只发公开搜索词，不发飞书内部资料、凭据、私有地址或现场日志。"
+                    "返回标题、链接和搜索摘要；这些内容是待核对的资料。"
+                ),
+                "parameters": PublicWebSearchArguments.model_json_schema(),
+            },
+        },
+        "handler": public_search.search_public_web,
+        "arguments_model": PublicWebSearchArguments,
+    },
     prometheus_tools.TOOL_NAME: {
         "definition": {
             "type": "function",
@@ -71,10 +89,9 @@ TOOL_REGISTRY = {
             "function": {
                 "name": holmes_ask.TOOL_NAME,
                 "description": (
-                    "仅当用户需要检查当前 Kubernetes 集群、服务或运行环境的实时状态、"
-                    "事件、日志或故障原因时使用。将用户要调查的问题作为 question，"
-                    "保留原问题中的目标和查询范围，缺少关键目标时先追问；"
-                    "不用于一般知识问答或 Jenkins 构建查询。"
+                    "分步读取本地 Kubernetes 证据。目标不明用 overview，namespace 可省略。"
+                    "选出候选后按线索用 workload、pod、network 或 dependencies。只有已确认 Pod 和容器时才用 logs。"
+                    "访问故障时填写已知的 service 和 host，把路径和症状保留在 question。"
                 ),
                 "parameters": HolmesAskArguments.model_json_schema(),
             },
@@ -88,10 +105,10 @@ TOOL_REGISTRY = {
             "function": {
                 "name": feishu_knowledge.TOOL_NAME,
                 "description": (
-                    "当用户询问企业制度、操作流程、内部约定或历史记录时，"
+                    "仅当用户的问题明确依赖企业内部资料或飞书文档时，"
                     "按相关性搜索飞书云文档的正文片段。query 填具体主题或关键词，"
                     "已知准确文档标题时用 title 限定范围。需要总结整篇时改用 read_feishu_document；"
-                    "不要用于实时集群状态或 Jenkins 构建查询。"
+                    "通用知识、闲聊、公开话题和仅仅遇到陌生名称不适用。"
                 ),
                 "parameters": FeishuKnowledgeSearchArguments.model_json_schema(),
             },

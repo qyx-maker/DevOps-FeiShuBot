@@ -2,6 +2,7 @@
 import json
 import os
 import time
+from dataclasses import dataclass
 
 from openai import OpenAI
 
@@ -16,6 +17,40 @@ BUILD_POLL_INTERVAL_SECONDS = 2
 ConversationHistory = tuple[tuple[str, str], ...]
 
 
+@dataclass
+class TokenUsage:
+    requests: int = 0
+    reported: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def record(self, response) -> None:
+        usage = getattr(response, "usage", None)
+        prompt = getattr(usage, "prompt_tokens", None)
+        completion = getattr(usage, "completion_tokens", None)
+        total = getattr(usage, "total_tokens", None)
+        if not all(type(value) is int and value >= 0 for value in (prompt, completion, total)):
+            return
+        self.reported += 1
+        self.prompt_tokens += prompt
+        self.completion_tokens += completion
+        self.total_tokens += total
+
+    def footer(self) -> str:
+        if not self.requests:
+            return "本条未调用 DeepSeek。"
+        if not self.reported:
+            return f"本条 DeepSeek Token 用量未返回（请求 {self.requests} 次）。"
+        coverage = f"{self.requests} 次请求"
+        if self.reported < self.requests:
+            coverage = f"仅统计有用量的 {self.reported}/{self.requests} 次请求"
+        return (
+            f"本条 DeepSeek 用量（{coverage}）：输入 {self.prompt_tokens:,}，"
+            f"输出 {self.completion_tokens:,}，合计 {self.total_tokens:,} Token。"
+        )
+
+
 def _request_completion(client: OpenAI, messages: list[dict]):
     """向 DeepSeek 发送一轮对话，并开放当前注册的工具。"""
     return client.chat.completions.create(
@@ -28,10 +63,8 @@ def _request_completion(client: OpenAI, messages: list[dict]):
     )
 
 
-def _assistant_tool_call_message(message, call, arguments: str | None = None) -> dict:
-    """将 SDK 的工具调用转换成下一轮对话可回送的 assistant 消息。"""
-    if arguments is None:
-        arguments = call.function.arguments
+def _assistant_tool_calls_message(message, calls_and_arguments) -> dict:
+    """保留同一条 assistant 消息中的全部调用及其推理上下文。"""
     assistant_message = {
         "role": "assistant",
         "content": message.content,
@@ -44,12 +77,20 @@ def _assistant_tool_call_message(message, call, arguments: str | None = None) ->
                     "arguments": arguments,
                 },
             }
+            for call, arguments in calls_and_arguments
         ],
     }
     reasoning_content = getattr(message, "reasoning_content", None)
     if isinstance(reasoning_content, str):
         assistant_message["reasoning_content"] = reasoning_content
     return assistant_message
+
+
+def _read_tool_result(name: str, arguments: str) -> str:
+    try:
+        return tool.execute_tool(name, arguments)
+    except Exception:
+        return json.dumps({"status": "UNAVAILABLE", "message": "工具执行失败，未取得证据。"}, ensure_ascii=False)
 
 
 def _wait_for_build(job_name: str, build_number: int) -> tuple[str, str | None]:
@@ -88,7 +129,10 @@ def _include_trigger_result(answer: str, triggered_build: tuple[str, int, str | 
     return f"{notice}\n\n{answer}"
 
 
-def ask_deepseek(user_text: str, history: ConversationHistory = ()) -> str:
+def ask_deepseek(
+    user_text: str, history: ConversationHistory = (), *,
+    allow_build: bool = True, usage: TokenUsage | None = None,
+) -> str:
     # 输入是用户发的正文，输出是模型的回答。这里不需要飞书的消息 ID。
     load_project_environment()
     api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
@@ -112,7 +156,15 @@ def ask_deepseek(user_text: str, history: ConversationHistory = ()) -> str:
             {"role": "assistant", "content": previous_answer},
         ])
     messages.append({"role": "user", "content": user_text})
-    response = _request_completion(client, messages)
+    def complete():
+        if usage is not None:
+            usage.requests += 1
+        response = _request_completion(client, messages)
+        if usage is not None:
+            usage.record(response)
+        return response
+
+    response = complete()
     tool_rounds = 0
     prometheus_queries = 0
     triggered_build = None
@@ -128,11 +180,39 @@ def ask_deepseek(user_text: str, history: ConversationHistory = ()) -> str:
         if tool_rounds >= MAX_TOOL_ROUNDS:
             return "工具调用次数已达到上限，无法完成本次操作。"
         if len(message.tool_calls) != 1:
-            return "每轮只能执行一个工具调用，请分开提出多个操作。"
+            calls = message.tool_calls
+            if any(not call.id for call in calls) or len({call.id for call in calls}) != len(calls):
+                return "模型工具调用编号无效，无法对应查询结果。"
+            rounds_before_batch = tool_rounds
+            messages.append(_assistant_tool_calls_message(
+                message, [(call, call.function.arguments) for call in calls]
+            ))
+            for call in calls:
+                name = call.function.name
+                if name == jenkins_tools.TRIGGER_TOOL_NAME:
+                    allow_build = False
+                    result = "此批次只执行查询。如需构建，请用户另发明确请求。"
+                elif tool_rounds >= MAX_TOOL_ROUNDS:
+                    result = "工具调用次数已达到上限。"
+                elif triggered_build is not None and name in {jenkins_tools.TOOL_NAME, jenkins_tools.LOGS_TOOL_NAME}:
+                    result = "请单独查询本次触发的构建，以便校验构建编号。"
+                elif name == prometheus_tools.TOOL_NAME and prometheus_queries >= prometheus_tools.MAX_QUERIES_PER_REQUEST:
+                    result = "本轮 Prometheus 查询次数已用完。"
+                else:
+                    tool_rounds += 1
+                    if name == prometheus_tools.TOOL_NAME:
+                        prometheus_queries += 1
+                    result = _read_tool_result(name, call.function.arguments)
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+            tool_rounds = max(tool_rounds, rounds_before_batch + 1)
+            response = complete()
+            continue
 
         call = message.tool_calls[0]
         if not call.id:
             return "模型工具调用缺少编号，操作已停止。"
+        if call.function.name == jenkins_tools.TRIGGER_TOOL_NAME and not allow_build:
+            return "当前请求只执行查询。要触发构建，请单独发送明确的文字请求。"
         if call.function.name == jenkins_tools.TRIGGER_TOOL_NAME and triggered_build is not None:
             return "本次对话已触发过构建，为避免重复启动，停止后续触发请求。"
 
@@ -152,13 +232,15 @@ def ask_deepseek(user_text: str, history: ConversationHistory = ()) -> str:
             tool_arguments = json.dumps(parsed_arguments, ensure_ascii=False)
 
         tool_rounds += 1
-        messages.append(_assistant_tool_call_message(message, call, tool_arguments))
+        messages.append(_assistant_tool_calls_message(message, [(call, tool_arguments)]))
         if call.function.name == prometheus_tools.TOOL_NAME:
             prometheus_queries += 1
         if call.function.name == prometheus_tools.TOOL_NAME and prometheus_queries > prometheus_tools.MAX_QUERIES_PER_REQUEST:
             tool_result = json.dumps({"status": "LIMIT_REACHED", "message": "本轮 Prometheus 查询次数已用完。"}, ensure_ascii=False)
-        else:
+        elif call.function.name == jenkins_tools.TRIGGER_TOOL_NAME:
             tool_result = tool.execute_tool(call.function.name, tool_arguments)
+        else:
+            tool_result = _read_tool_result(call.function.name, tool_arguments)
         messages.append(
             {
                 "role": "tool",
@@ -252,4 +334,4 @@ def ask_deepseek(user_text: str, history: ConversationHistory = ()) -> str:
                     triggered_build,
                 )
 
-        response = _request_completion(client, messages)
+        response = complete()

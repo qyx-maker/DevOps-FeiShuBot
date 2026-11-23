@@ -1,10 +1,27 @@
 """Pydantic 参数模型，用于生成 Jenkins 工具 schema 并校验模型输出。"""
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class StrictToolArguments(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class PublicWebSearchArguments(StrictToolArguments):
+    query: str = Field(min_length=1, max_length=400, description="仅包含公开信息的精简搜索词，可指定 site: 或 lang:zh。")
+    freshness: Literal["day", "week", "month", "year"] | None = Field(
+        default=None, description="仅当用户要求近期消息时设置。没有时间要求就省略。",
+    )
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, value: str) -> str:
+        value = value.strip()
+        if not value or len(value.split()) > 75:
+            raise ValueError("搜索词不能为空或超过 75 个词")
+        return value
 
 
 class PrometheusMetricArguments(StrictToolArguments):
@@ -74,6 +91,40 @@ class HolmesAskArguments(StrictToolArguments):
         description="需要 Holmes 检查的集群、服务或运行环境问题",
         min_length=1,
     )
+    namespace: str | None = Field(
+        default=None,
+        pattern=r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+        description="目标命名空间。未知时省略，先用 overview 定位。",
+    )
+    service: str | None = Field(
+        default=None, pattern=r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+        description="已知的 Service 名。查询访问异常时尽量提供。",
+    )
+    host: str | None = Field(
+        default=None, min_length=1, max_length=253,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9.-]*$",
+        description="URL 中的主机名，不含协议、端口或路径。只用于匹配集群路由，不向该主机发请求。",
+    )
+    mode: Literal["overview", "network", "workload", "pod", "logs", "dependencies"] | None = Field(
+        default=None,
+        description="不明确先用 overview；访问故障用 network；发布查 workload；单 Pod 用 pod；需要日志用 logs；存储/网络策略用 dependencies。",
+    )
+    pod: str | None = Field(default=None, max_length=253, pattern=r"^[a-z0-9][a-z0-9.-]*$")
+    container: str | None = Field(default=None, max_length=63, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    previous: bool = False
+
+    @model_validator(mode="after")
+    def validate_diagnostic_scope(self):
+        mode = self.mode or ("network" if self.namespace else "overview")
+        if mode != "overview" and not self.namespace:
+            raise ValueError("定向诊断需要 namespace")
+        if mode in {"pod", "logs"} and not self.pod:
+            raise ValueError("Pod 详情和日志查询需要 pod")
+        if mode == "logs" and not self.container:
+            raise ValueError("日志查询需要已确认的 container")
+        if mode != "logs" and (self.container or self.previous):
+            raise ValueError("container 和 previous 仅用于 logs")
+        return self
 
     @field_validator("question")
     @classmethod
