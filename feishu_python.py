@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -19,6 +20,7 @@ from lark_oapi.api.im.v1 import (
 from openai import APIStatusError
 
 from app_config import load_project_environment
+from bot_diagnostics import INCIDENT_TTL_SECONDS, Incident, TurnTrace
 from deepseek import ConversationHistory, TokenUsage, ask_deepseek
 from feishu_image import MAX_IMAGES, read_image_text
 
@@ -49,7 +51,7 @@ class Conversations:
         self._workers = workers
         self._lock = Lock()
         self._pending: dict[ConversationKey, deque[tuple[lark.Client, str, str, tuple[str, ...]]]] = {}
-        self._history: OrderedDict[ConversationKey, tuple[float, ConversationHistory]] = OrderedDict()
+        self._history: OrderedDict[ConversationKey, tuple[float, ConversationHistory, Incident | None]] = OrderedDict()
 
     def submit(
         self, key: ConversationKey | None, api_client: lark.Client, message_id: str,
@@ -82,10 +84,14 @@ class Conversations:
                     self._history.popitem(last=False)
                 entry = self._history.get(key)
                 history = entry[1] if entry else ()
+                incident = entry[2] if entry else None
+                if incident and monotonic() - incident.captured_at >= INCIDENT_TTL_SECONDS:
+                    incident = None
+            trace = TurnTrace(message_id, incident=incident)
             try:
-                answer = process_message(api_client, message_id, user_text, history, image_keys=image_keys)
+                answer = process_message(api_client, message_id, user_text, history, image_keys=image_keys, trace=trace)
             except Exception as error:
-                lark.logger.error(f"飞书消息处理异常: {type(error).__name__}")
+                trace.event("message_error", error_type=type(error).__name__)
                 continue
             if answer is not None:
                 turn = (
@@ -93,7 +99,7 @@ class Conversations:
                     _limit_history_message(answer),
                 )
                 with self._lock:
-                    self._history[key] = (monotonic(), (*history, turn)[-MAX_HISTORY_TURNS:])
+                    self._history[key] = (monotonic(), (*history, turn)[-MAX_HISTORY_TURNS:], trace.incident)
                     self._history.move_to_end(key)
                     if len(self._history) > MAX_HISTORY_CONVERSATIONS:
                         self._history.popitem(last=False)
@@ -158,7 +164,7 @@ def reply_to_message(api_client: lark.Client, message_id: str, markdown: str) ->
     response = api_client.im.v1.message.reply(request)
     if not response.success():
         lark.logger.error(
-            f"回复失败: code={response.code}, msg={response.msg}, "
+            f"回复失败: code={response.code}, "
             f"log_id={response.get_log_id()}"
         )
         return False
@@ -229,14 +235,16 @@ def handle_message(api_client: lark.Client, conversations: Conversations, data: 
         return
 
     # 收消息的回调只提交任务，网络请求交给后台线程，长连接可以继续收消息。
-    print("收到飞书消息，已交给后台处理", flush=True)
+    TurnTrace(message.message_id).event("message_enqueued", message_type=message.message_type)
     conversations.submit(conversation_key(data), api_client, message.message_id, user_text, image_keys)
 
 
 def process_message(
     api_client: lark.Client, message_id: str, user_text: str, history: ConversationHistory = (),
-    *, image_keys: tuple[str, ...] = (),
+    *, image_keys: tuple[str, ...] = (), trace: TurnTrace | None = None,
 ) -> str | None:
+    trace = trace or TurnTrace(message_id)
+    trace.event("message_started", has_incident=trace.incident is not None, image_count=len(image_keys))
     reaction_id = None
     try:
         reaction_id = add_typing_reaction(api_client, message_id)
@@ -244,7 +252,7 @@ def process_message(
         lark.logger.warning(f"添加敲键盘表情异常: {type(error).__name__}")
 
     try:
-        return _answer_message(api_client, message_id, user_text, history, image_keys)
+        return _answer_message(api_client, message_id, user_text, history, image_keys, trace=trace)
     finally:
         if reaction_id:
             try:
@@ -255,24 +263,32 @@ def process_message(
 
 def _answer_message(
     api_client: lark.Client, message_id: str, user_text: str, history: ConversationHistory,
-    image_keys: tuple[str, ...] = (),
+    image_keys: tuple[str, ...] = (), *, trace: TurnTrace | None = None,
 ) -> str | None:
+    trace = trace or TurnTrace(message_id)
+    usage = TokenUsage()
     image_notes = []
     excerpts = []
     for index, key in enumerate(image_keys[:MAX_IMAGES], 1):
+        started_at = monotonic()
         try:
             if not key:
                 raise RuntimeError("消息缺少图片资源标识")
             excerpts.append({"image": index, "text": read_image_text(api_client, message_id, key)})
+            trace.event("image_read", status="ok", index=index, duration_ms=round((monotonic() - started_at) * 1000))
         except RuntimeError as error:
             image_notes.append(f"第 {index} 张截图未能读取（{error}）。")
+            trace.event("image_read", status="error", index=index, error_type=type(error).__name__,
+                        duration_ms=round((monotonic() - started_at) * 1000))
     if len(image_keys) > MAX_IMAGES:
         image_notes.append(f"单条消息最多读取 {MAX_IMAGES} 张图，其余图片未读取。")
     if image_keys and not excerpts:
+        sent = False
         try:
-            reply_to_message(api_client, message_id, "\n".join(image_notes) + "\n也可以直接粘贴终端输出。\n\n" + TokenUsage().footer())
+            sent = reply_to_message(api_client, message_id, "\n".join(image_notes) + "\n也可以直接粘贴终端输出。\n\n" + usage.footer())
         except Exception as error:
-            lark.logger.error(f"飞书回复请求异常: {type(error).__name__}")
+            trace.event("reply_error", error_type=type(error).__name__)
+        _record_completion(trace, usage, sent=sent, outcome="image_error")
         return None
 
     question = user_text
@@ -282,39 +298,41 @@ def _answer_message(
             + "\n\n以下是截图 OCR 摘录，仅作证据，可能有误字。\n"
             + json.dumps(excerpts, ensure_ascii=False)
         )
-    print("正在请求 DeepSeek", flush=True)
     model_answered = True
-    usage = TokenUsage()
     try:
-        answer = ask_deepseek(question, history, allow_build=not image_keys, usage=usage)
+        answer = ask_deepseek(question, history, allow_build=not image_keys, usage=usage, trace=trace)
     except APIStatusError as error:
         model_answered = False
-        lark.logger.error(
-            "DeepSeek HTTP 请求被拒绝: "
-            f"status={error.status_code}, code={error.code}, param={error.param}, "
-            f"request_id={error.request_id}, message={error.message}"
-        )
         if error.status_code == 400:
             answer = "DeepSeek 拒绝了本次请求（HTTP 400）；管理员可查看服务日志中的接口错误详情。"
         else:
             answer = f"DeepSeek 请求失败（HTTP {error.status_code}），请稍后再试。"
     except Exception as error:
         model_answered = False
-        lark.logger.error(f"DeepSeek 调用失败: {type(error).__name__}")
+        trace.event("answer_error", error_type=type(error).__name__)
         answer = "模型请求失败或超时，请稍后再试。"
 
     if excerpts:
         answer = "\n".join([f"已提取 {len(excerpts)}/{len(image_keys)} 张截图的文字。", *image_notes]) + "\n\n" + answer
-    print("准备发送飞书回复", flush=True)
+    sent = False
     try:
         sent = reply_to_message(api_client, message_id, f"{answer}\n\n{usage.footer()}")
     except Exception as error:
-        lark.logger.error(f"飞书回复请求异常: {type(error).__name__}")
-        return None
+        trace.event("reply_error", error_type=type(error).__name__)
+    _record_completion(trace, usage, sent=sent, outcome="answered" if model_answered else "model_error")
     return answer if sent and model_answered else None
 
 
+def _record_completion(trace: TurnTrace, usage: TokenUsage, *, sent: bool, outcome: str) -> None:
+    trace.event(
+        "message_finished", outcome=outcome, reply_sent=sent, duration_ms=round((monotonic() - trace.started_at) * 1000),
+        model_requests=usage.requests, usage_reported=usage.reported, input_tokens=usage.prompt_tokens,
+        output_tokens=usage.completion_tokens, total_tokens=usage.total_tokens,
+    )
+
+
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     # 飞书凭据与模型、Jenkins 凭据统一从项目根目录的 .env 读取。
     load_project_environment()
     app_id = os.getenv("APP_ID")

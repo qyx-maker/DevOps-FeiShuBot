@@ -8,6 +8,10 @@
 
 大肥鱼会把最近 4 轮成功回复的问答带给模型。私聊按会话记忆，群聊按群、发言人和话题隔离。同一会话按收到的顺序处理。记忆保存在进程内，闲置 30 分钟后不再使用，重启清空；不会补读飞书历史消息。
 
+同一会话还会保留最近一次集群排障的目标、精简证据和查询缺口。命名空间及服务标签都匹配时会保存指标时间窗。排障证据在采集后 30 分钟失效，问实时状态时仍会重新取证。
+
+排障和回复的运行日志按飞书 `message_id` 串起来。搜索命中数量、工具耗时与状态、模型请求结果和本条 Token 汇总都可在终端查找。诊断日志不记录聊天正文、工具参数、容器日志或凭据。
+
 闲聊和公开话题可直接回答。飞书回复底部显示当前消息对应的 DeepSeek 请求次数与输入、输出、合计 Token，按 API 返回的用量累加。未返回用量的请求会标明，统计行不进入会话记忆。
 
 处理终端或日志截图时，机器人使用飞书消息资源接口读取当前消息的图片，再用 macOS Vision 本地提取文字。单条最多识别 3 张，每张最多 8 MiB，需要 macOS 和 Xcode 命令行工具。模型接收 OCR 摘录，原图在本地处理。下载或识别失败时回复实际原因。
@@ -38,7 +42,7 @@ test -f .env || cp .env.example .env
 | --- | --- |
 | `APP_ID`、`APP_SECRET` | 飞书自建应用凭据，用于机器人收发消息和读取知识库 |
 | `DEEPSEEK_API_KEY` | DeepSeek API Key；主对话和 Holmes 共用 |
-| `BRAVE_SEARCH_API_KEY` | 可选。公开网页搜索使用的 Brave Search API Key |
+| `TAVILY_API_KEY` | 可选。公开网页搜索使用 Tavily Search API，留空时使用有频率限制的无密钥模式 |
 | `JENKINS_USERNAME`、`JENKINS_API_TOKEN` | Jenkins 用户和 API Token；查询需要读取权限，触发测试任务还需要该任务的构建权限 |
 | `PROMETHEUS_URL`、`PROMETHEUS_ENVIRONMENT` | 可选；同一个测试环境的 Prometheus 地址和环境名。地址只填服务入口，不含 `/api/v1/query_range` |
 | `PROMETHEUS_BEARER_TOKEN` | 可选；服务入口需要 Bearer 认证时使用只读凭据 |

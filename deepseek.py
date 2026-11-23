@@ -7,11 +7,12 @@ from dataclasses import dataclass
 from openai import OpenAI
 
 from app_config import PROJECT_ROOT, load_project_environment
+from bot_diagnostics import TurnTrace
 import jenkins_tools
 import prometheus_tools
 import tool
 
-MAX_TOOL_ROUNDS = 8
+MAX_TOOL_CALLS = 8
 MAX_BUILD_POLL_ATTEMPTS = 120
 BUILD_POLL_INTERVAL_SECONDS = 2
 ConversationHistory = tuple[tuple[str, str], ...]
@@ -51,13 +52,13 @@ class TokenUsage:
         )
 
 
-def _request_completion(client: OpenAI, messages: list[dict]):
-    """向 DeepSeek 发送一轮对话，并开放当前注册的工具。"""
+def _request_completion(client: OpenAI, messages: list[dict], *, tool_choice: str = "auto"):
+    """向 DeepSeek 发送一轮对话。收尾阶段可禁用工具调用。"""
     return client.chat.completions.create(
         model="deepseek-flash",
         messages=messages,
         tools=tool.tools,
-        tool_choice="auto",
+        tool_choice=tool_choice,
         stream=False,
         reasoning_effort="high",
     )
@@ -131,7 +132,7 @@ def _include_trigger_result(answer: str, triggered_build: tuple[str, int, str | 
 
 def ask_deepseek(
     user_text: str, history: ConversationHistory = (), *,
-    allow_build: bool = True, usage: TokenUsage | None = None,
+    allow_build: bool = True, usage: TokenUsage | None = None, trace: TurnTrace | None = None,
 ) -> str:
     # 输入是用户发的正文，输出是模型的回答。这里不需要飞书的消息 ID。
     load_project_environment()
@@ -147,6 +148,11 @@ def ask_deepseek(
     )
 
     agent_rules = (PROJECT_ROOT / "agent.md").read_text(encoding="utf-8")
+    if trace and trace.incident:
+        agent_rules += (
+            "\n\n以下是同会话上次排障的结构化历史证据。仅用于延续同一目标，"
+            "用户改了目标时忽略。历史观测不代表当前状态。\n" + trace.incident.as_context()
+        )
     messages = [
         {"role": "system", "content": agent_rules},
     ]
@@ -156,16 +162,53 @@ def ask_deepseek(
             {"role": "assistant", "content": previous_answer},
         ])
     messages.append({"role": "user", "content": user_text})
-    def complete():
+    def complete(*, summarize: bool = False):
+        started_at = time.monotonic()
         if usage is not None:
             usage.requests += 1
-        response = _request_completion(client, messages)
+        try:
+            if summarize:
+                final_instruction = (
+                    "工具调用预算已用完。请直接回答最初的问题，依据已获得的工具结果给出阶段结论。"
+                    "引用实际来源，标出仍缺少的证据。没有查到的事实不要补写。"
+                )
+                response = _request_completion(
+                    client, [*messages, {"role": "user", "content": final_instruction}], tool_choice="none",
+                )
+            else:
+                response = _request_completion(client, messages)
+        except Exception as error:
+            if trace:
+                trace.event("model_request", status="error", error_type=type(error).__name__,
+                            http_status=getattr(error, "status_code", None),
+                            duration_ms=round((time.monotonic() - started_at) * 1000))
+            raise
+        if trace:
+            trace.event("model_request", status="ok", summarize=summarize,
+                        duration_ms=round((time.monotonic() - started_at) * 1000))
         if usage is not None:
             usage.record(response)
         return response
 
+    def dispatch(name: str, arguments: str) -> str:
+        started_at = time.monotonic()
+        if name == jenkins_tools.TRIGGER_TOOL_NAME:
+            result = tool.execute_tool(name, arguments)
+        else:
+            result = _read_tool_result(name, arguments)
+        if trace:
+            trace.tool_result(name, result, started_at)
+        return result
+
+    def summarize_at_limit() -> str:
+        message = complete(summarize=True).choices[0].message
+        answer = (message.content or "").strip()
+        if not answer:
+            return _include_trigger_result("已达工具调用上限。模型未返回阶段结论。", triggered_build)
+        return _include_trigger_result(f"{answer}\n\n已达 {MAX_TOOL_CALLS} 次工具调用上限，以上基于本轮已取得的结果。", triggered_build)
+
     response = complete()
-    tool_rounds = 0
+    tool_calls_used = 0
     prometheus_queries = 0
     triggered_build = None
 
@@ -177,34 +220,32 @@ def ask_deepseek(
                 raise RuntimeError("DeepSeek 没有返回正文")
             return _include_trigger_result(answer, triggered_build)
 
-        if tool_rounds >= MAX_TOOL_ROUNDS:
-            return "工具调用次数已达到上限，无法完成本次操作。"
         if len(message.tool_calls) != 1:
             calls = message.tool_calls
             if any(not call.id for call in calls) or len({call.id for call in calls}) != len(calls):
                 return "模型工具调用编号无效，无法对应查询结果。"
-            rounds_before_batch = tool_rounds
             messages.append(_assistant_tool_calls_message(
                 message, [(call, call.function.arguments) for call in calls]
             ))
             for call in calls:
                 name = call.function.name
-                if name == jenkins_tools.TRIGGER_TOOL_NAME:
+                if tool_calls_used >= MAX_TOOL_CALLS:
+                    result = "未执行，工具调用次数已达到上限。"
+                elif name == jenkins_tools.TRIGGER_TOOL_NAME:
                     allow_build = False
                     result = "此批次只执行查询。如需构建，请用户另发明确请求。"
-                elif tool_rounds >= MAX_TOOL_ROUNDS:
-                    result = "工具调用次数已达到上限。"
                 elif triggered_build is not None and name in {jenkins_tools.TOOL_NAME, jenkins_tools.LOGS_TOOL_NAME}:
                     result = "请单独查询本次触发的构建，以便校验构建编号。"
                 elif name == prometheus_tools.TOOL_NAME and prometheus_queries >= prometheus_tools.MAX_QUERIES_PER_REQUEST:
                     result = "本轮 Prometheus 查询次数已用完。"
                 else:
-                    tool_rounds += 1
                     if name == prometheus_tools.TOOL_NAME:
                         prometheus_queries += 1
-                    result = _read_tool_result(name, call.function.arguments)
+                    result = dispatch(name, call.function.arguments)
+                tool_calls_used = min(tool_calls_used + 1, MAX_TOOL_CALLS)
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-            tool_rounds = max(tool_rounds, rounds_before_batch + 1)
+            if tool_calls_used >= MAX_TOOL_CALLS:
+                return summarize_at_limit()
             response = complete()
             continue
 
@@ -231,16 +272,14 @@ def ask_deepseek(
             parsed_arguments["build_number"] = triggered_build[1]
             tool_arguments = json.dumps(parsed_arguments, ensure_ascii=False)
 
-        tool_rounds += 1
+        tool_calls_used += 1
         messages.append(_assistant_tool_calls_message(message, [(call, tool_arguments)]))
         if call.function.name == prometheus_tools.TOOL_NAME:
             prometheus_queries += 1
         if call.function.name == prometheus_tools.TOOL_NAME and prometheus_queries > prometheus_tools.MAX_QUERIES_PER_REQUEST:
             tool_result = json.dumps({"status": "LIMIT_REACHED", "message": "本轮 Prometheus 查询次数已用完。"}, ensure_ascii=False)
-        elif call.function.name == jenkins_tools.TRIGGER_TOOL_NAME:
-            tool_result = tool.execute_tool(call.function.name, tool_arguments)
         else:
-            tool_result = _read_tool_result(call.function.name, tool_arguments)
+            tool_result = dispatch(call.function.name, tool_arguments)
         messages.append(
             {
                 "role": "tool",
@@ -290,7 +329,11 @@ def ask_deepseek(
             if not isinstance(job_name, str) or type(build_number) is not int:
                 return "Jenkins 已返回触发结果，但缺少有效构建编号，无法查询状态。"
             triggered_build = (job_name, build_number, build_url if isinstance(build_url, str) else None)
+            poll_started = time.monotonic()
             build_status, status_result = _wait_for_build(job_name, build_number)
+            if trace:
+                trace.event("build_wait", status=build_status,
+                            duration_ms=round((time.monotonic() - poll_started) * 1000))
             if build_status == "SUCCESS":
                 return _include_trigger_result(f"「{job_name}」构建成功。", triggered_build)
             if build_status == "FAILURE" and status_result is not None:
@@ -334,4 +377,6 @@ def ask_deepseek(
                     triggered_build,
                 )
 
+        if tool_calls_used >= MAX_TOOL_CALLS:
+            return summarize_at_limit()
         response = complete()
